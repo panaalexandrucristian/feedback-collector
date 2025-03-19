@@ -1,357 +1,161 @@
-package db
+package database
 
 import (
-	"database/sql"
-	"errors"
 	"fmt"
-	"log"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/golang-migrate/migrate/v4"
-	"github.com/golang-migrate/migrate/v4/database/postgres"
-	_ "github.com/golang-migrate/migrate/v4/source/file"
-	_ "github.com/lib/pq"
-	"golang.org/x/crypto/bcrypt"
-
-	"github.com/panaalexandrucristian/feedback-collector/internal/models"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
-// Database wraps the SQL database connection
-type Database struct {
-	*sql.DB
+var DB *gorm.DB
+
+// Migration represents a database migration
+type Migration struct {
+	ID          int
+	Name        string
+	Description string
+	FilePath    string
 }
 
-// New creates a new Database instance
-func New(dataSourceName string) (*Database, error) {
-	db, err := sql.Open("postgres", dataSourceName)
-	if err != nil {
-		return nil, fmt.Errorf("error opening database: %w", err)
-	}
-
-	// Configure connection pool
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	// Check connection
-	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("error connecting to database: %w", err)
-	}
-
-	log.Println("Database connection established")
-	return &Database{db}, nil
+// MigrationRecord keeps track of which migrations have been executed
+type MigrationRecord struct {
+	ID          uint   `gorm:"primaryKey"`
+	MigrationID int    `gorm:"uniqueIndex"`
+	Name        string `gorm:"size:255;not null"`
+	Description string `gorm:"size:255"`
+	ExecutedAt  time.Time
 }
 
-// RunMigrations applies database migrations from the specified path
-func (db *Database) RunMigrations(migrationsPath string) error {
-	driver, err := postgres.WithInstance(db.DB, &postgres.Config{})
+func Init() {
+	var err error
+	DB, err = gorm.Open(sqlite.Open("feature_collector.db"), &gorm.Config{})
 	if err != nil {
-		return fmt.Errorf("failed to create migration driver: %w", err)
+		panic("failed to connect database")
 	}
 
-	m, err := migrate.NewWithDatabaseInstance(
-		fmt.Sprintf("file://%s", migrationsPath),
-		"postgres",
-		driver,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to initialize migrations: %w", err)
-	}
+	// Create the migrations table if it doesn't exist
+	DB.AutoMigrate(&MigrationRecord{})
 
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		return fmt.Errorf("failed to apply migrations: %w", err)
-	}
-
-	return nil
+	// Run migrations
+	runSQLMigrations()
 }
 
-// InitSchema creates the necessary database tables if they don't exist
-func (db *Database) InitSchema() error {
-	schema := `
-    -- Users table
-    CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        password_hash VARCHAR(255) NOT NULL,
-        subscription_type VARCHAR(20) NOT NULL DEFAULT 'free',
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-    );
+// runSQLMigrations runs SQL migrations from the migrations directory
+func runSQLMigrations() {
+	fmt.Println("Running SQL migrations...")
 
-    -- Rooms table
-    CREATE TABLE IF NOT EXISTS rooms (
-        id VARCHAR(10) PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        password VARCHAR(255),
-        creator_id INTEGER REFERENCES users(id),
-        is_password_protected BOOLEAN NOT NULL DEFAULT FALSE,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-    );
-
-    -- Feedback table
-    CREATE TABLE IF NOT EXISTS feedback (
-        id SERIAL PRIMARY KEY,
-        room_id VARCHAR(10) REFERENCES rooms(id),
-        content TEXT NOT NULL,
-        sentiment VARCHAR(20),
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-    );
-    `
-
-	_, err := db.Exec(schema)
-	if err != nil {
-		return fmt.Errorf("error initializing database schema: %w", err)
-	}
-	log.Println("Database schema initialized")
-	return nil
-}
-
-// ===== User-related functions =====
-
-// CreateUser creates a new user in the database
-func (db *Database) CreateUser(email, password string) (*models.User, error) {
-	// Hash password
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return nil, fmt.Errorf("error hashing password: %w", err)
+	// Get list of applied migrations
+	var appliedMigrations []MigrationRecord
+	if err := DB.Order("migration_id").Find(&appliedMigrations).Error; err != nil {
+		panic(fmt.Errorf("failed to fetch applied migrations: %w", err))
 	}
 
-	user := &models.User{}
-	query := `
-        INSERT INTO users (email, password_hash, subscription_type)
-        VALUES ($1, $2, 'free')
-        RETURNING id, email, subscription_type, created_at
-    `
-
-	err = db.QueryRow(query, email, string(hashedPassword)).Scan(
-		&user.ID,
-		&user.Email,
-		&user.SubscriptionType,
-		&user.CreatedAt,
-	)
-
-	if err != nil {
-		return nil, fmt.Errorf("error creating user: %w", err)
+	appliedIDs := make(map[int]bool)
+	for _, migration := range appliedMigrations {
+		appliedIDs[migration.MigrationID] = true
 	}
 
-	return user, nil
-}
+	// Scan migration files
+	migrations := scanMigrationFiles()
 
-// GetUserByEmail retrieves a user by email address
-func (db *Database) GetUserByEmail(email string) (*models.User, error) {
-	user := &models.User{}
-	query := `
-        SELECT id, email, password_hash, subscription_type, created_at 
-        FROM users WHERE email = $1
-    `
+	// Sort migrations by ID
+	sort.Slice(migrations, func(i, j int) bool {
+		return migrations[i].ID < migrations[j].ID
+	})
 
-	err := db.QueryRow(query, email).Scan(
-		&user.ID,
-		&user.Email,
-		&user.PasswordHash,
-		&user.SubscriptionType,
-		&user.CreatedAt,
-	)
+	// Run pending migrations
+	for _, migration := range migrations {
+		if !appliedIDs[migration.ID] {
+			fmt.Printf("Applying migration %d: %s\n", migration.ID, migration.Name)
 
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, errors.New("user not found")
+			// Read SQL content from file
+			sql, err := ioutil.ReadFile(migration.FilePath)
+			if err != nil {
+				panic(fmt.Errorf("failed to read migration file %s: %w", migration.FilePath, err))
+			}
+
+			// Begin transaction
+			tx := DB.Begin()
+
+			// Execute migration
+			if err := tx.Exec(string(sql)).Error; err != nil {
+				tx.Rollback()
+				panic(fmt.Errorf("migration %d failed: %w", migration.ID, err))
+			}
+
+			// Record migration
+			if err := tx.Create(&MigrationRecord{
+				MigrationID: migration.ID,
+				Name:        migration.Name,
+				Description: migration.Description,
+				ExecutedAt:  time.Now(),
+			}).Error; err != nil {
+				tx.Rollback()
+				panic(fmt.Errorf("failed to record migration %d: %w", migration.ID, err))
+			}
+
+			// Commit transaction
+			tx.Commit()
+
+			fmt.Printf("Migration %d completed successfully\n", migration.ID)
+		} else {
+			fmt.Printf("Migration %d already applied\n", migration.ID)
 		}
-		return nil, fmt.Errorf("error retrieving user: %w", err)
 	}
-
-	return user, nil
 }
 
-// GetUserByID retrieves a user by ID
-func (db *Database) GetUserByID(id int) (*models.User, error) {
-	user := &models.User{}
-	query := `
-        SELECT id, email, subscription_type, created_at 
-        FROM users WHERE id = $1
-    `
-
-	err := db.QueryRow(query, id).Scan(
-		&user.ID,
-		&user.Email,
-		&user.SubscriptionType,
-		&user.CreatedAt,
-	)
-
+// scanMigrationFiles scans for migration files in the migrations directory
+func scanMigrationFiles() []Migration {
+	migrationsDir := "migrations"
+	files, err := os.ReadDir(migrationsDir)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, errors.New("user not found")
+		panic(fmt.Errorf("failed to read migrations directory: %w", err))
+	}
+
+	// Regular expression to match migration files: 001_description.sql
+	re := regexp.MustCompile(`^(\d+)_([a-zA-Z0-9_]+)\.sql$`)
+
+	var migrations []Migration
+
+	for _, file := range files {
+		if file.IsDir() {
+			continue
 		}
-		return nil, fmt.Errorf("error retrieving user: %w", err)
-	}
 
-	return user, nil
-}
-
-// ===== Room-related functions =====
-
-// CreateRoom creates a new room in the database
-func (db *Database) CreateRoom(roomID, name string, creatorID int, password string) (*models.Room, error) {
-	room := &models.Room{}
-	isPasswordProtected := password != ""
-
-	query := `
-        INSERT INTO rooms (id, name, password, creator_id, is_password_protected)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, name, creator_id, is_password_protected, created_at
-    `
-
-	err := db.QueryRow(query, roomID, name, password, creatorID, isPasswordProtected).Scan(
-		&room.ID,
-		&room.Name,
-		&room.CreatorID,
-		&room.IsPasswordProtected,
-		&room.CreatedAt,
-	)
-
-	if err != nil {
-		return nil, fmt.Errorf("error creating room: %w", err)
-	}
-
-	return room, nil
-}
-
-// GetRoomByID retrieves a room by its ID
-func (db *Database) GetRoomByID(id string) (*models.Room, error) {
-	room := &models.Room{}
-	query := `
-        SELECT id, name, password, creator_id, is_password_protected, created_at
-        FROM rooms WHERE id = $1
-    `
-
-	err := db.QueryRow(query, id).Scan(
-		&room.ID,
-		&room.Name,
-		&room.Password,
-		&room.CreatorID,
-		&room.IsPasswordProtected,
-		&room.CreatedAt,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, errors.New("room not found")
+		matches := re.FindStringSubmatch(file.Name())
+		if len(matches) != 3 {
+			// Not a migration file, skip
+			continue
 		}
-		return nil, fmt.Errorf("error retrieving room: %w", err)
-	}
 
-	return room, nil
-}
-
-// GetRoomsByUserID retrieves all rooms created by a specific user
-func (db *Database) GetRoomsByUserID(userID int) ([]models.Room, error) {
-	query := `
-        SELECT id, name, creator_id, is_password_protected, created_at
-        FROM rooms
-        WHERE creator_id = $1
-        ORDER BY created_at DESC
-    `
-
-	rows, err := db.Query(query, userID)
-	if err != nil {
-		return nil, fmt.Errorf("error retrieving rooms: %w", err)
-	}
-	defer rows.Close()
-
-	var rooms []models.Room
-	for rows.Next() {
-		var r models.Room
-		err := rows.Scan(
-			&r.ID,
-			&r.Name,
-			&r.CreatorID,
-			&r.IsPasswordProtected,
-			&r.CreatedAt,
-		)
+		id, err := strconv.Atoi(matches[1])
 		if err != nil {
-			return nil, fmt.Errorf("error scanning room row: %w", err)
+			fmt.Printf("Warning: Invalid migration ID in file %s\n", file.Name())
+			continue
 		}
-		rooms = append(rooms, r)
+
+		name := matches[2]
+		description := strings.ReplaceAll(name, "_", " ")
+
+		migrations = append(migrations, Migration{
+			ID:          id,
+			Name:        name,
+			Description: description,
+			FilePath:    filepath.Join(migrationsDir, file.Name()),
+		})
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating rooms: %w", err)
-	}
-
-	return rooms, nil
+	return migrations
 }
 
-// ===== Feedback-related functions =====
-
-// CreateFeedback creates a new feedback entry
-func (db *Database) CreateFeedback(roomID, content string) (*models.Feedback, error) {
-	feedback := &models.Feedback{}
-	query := `
-        INSERT INTO feedback (room_id, content)
-        VALUES ($1, $2)
-        RETURNING id, room_id, content, sentiment, created_at
-    `
-
-	err := db.QueryRow(query, roomID, content).Scan(
-		&feedback.ID,
-		&feedback.RoomID,
-		&feedback.Content,
-		&feedback.Sentiment,
-		&feedback.CreatedAt,
-	)
-
-	if err != nil {
-		return nil, fmt.Errorf("error creating feedback: %w", err)
-	}
-
-	return feedback, nil
-}
-
-// GetFeedbackByRoomID retrieves all feedback for a specific room
-func (db *Database) GetFeedbackByRoomID(roomID string) ([]models.Feedback, error) {
-	query := `
-        SELECT id, room_id, content, sentiment, created_at
-        FROM feedback
-        WHERE room_id = $1
-        ORDER BY created_at DESC
-    `
-
-	rows, err := db.Query(query, roomID)
-	if err != nil {
-		return nil, fmt.Errorf("error retrieving feedback: %w", err)
-	}
-	defer rows.Close()
-
-	var feedbackList []models.Feedback
-	for rows.Next() {
-		var f models.Feedback
-		err := rows.Scan(
-			&f.ID,
-			&f.RoomID,
-			&f.Content,
-			&f.Sentiment,
-			&f.CreatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error scanning feedback row: %w", err)
-		}
-		feedbackList = append(feedbackList, f)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating feedback: %w", err)
-	}
-
-	return feedbackList, nil
-}
-
-// UpdateFeedbackSentiment updates the sentiment analysis result for a feedback entry
-func (db *Database) UpdateFeedbackSentiment(feedbackID int, sentiment string) error {
-	query := `UPDATE feedback SET sentiment = $1 WHERE id = $2`
-
-	_, err := db.Exec(query, sentiment, feedbackID)
-	if err != nil {
-		return fmt.Errorf("error updating feedback sentiment: %w", err)
-	}
-
-	return nil
+func GetDB() *gorm.DB {
+	return DB
 }
